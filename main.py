@@ -19,7 +19,7 @@ from firebase_admin import credentials, firestore
 from gradcam import generate_gradcam
 from metrics_utils import compute_binary_metrics
 
-app = FastAPI(title="MEDORA Backend", version="2.1.0")
+app = FastAPI(title="MEDORA Backend", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,6 +42,8 @@ db = firestore.client()
 yolo_model = YOLO(YOLO_MODEL_PATH)
 
 
+# ---------------- EfficientNet ----------------
+
 class EffB3(nn.Module):
     def __init__(self):
         super().__init__()
@@ -61,9 +63,9 @@ efficientnet_model = EffB3()
 if os.path.exists(EFF_MODEL_PATH):
     state = torch.load(EFF_MODEL_PATH, map_location="cpu")
     efficientnet_model.load_state_dict(state, strict=False)
-    print("EfficientNet weights loaded successfully.")
+    print("EfficientNet weights loaded.")
 else:
-    print("WARNING: grazped_finetuned_best.pth not found.")
+    print("WARNING: model not found")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 efficientnet_model.to(DEVICE)
@@ -79,305 +81,207 @@ eff_transform = transforms.Compose([
 ])
 
 
-def clean_label(value: str | None) -> str | None:
-    if value is None:
-        return None
+# ---------------- VALIDATION ----------------
 
-    label = str(value).strip()
-    if not label:
-        return None
+def validate_wrist_xray(file: UploadFile, temp_path: str):
 
-    normalized = label.lower()
-    if normalized in {"fracture", "positive", "1"}:
-        return "Fracture"
-    if normalized in {"normal", "negative", "0"}:
-        return "Normal"
+    # type check
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only image allowed"
+        )
 
-    return None
+    # filename check
+    name = (file.filename or "").lower()
 
+    if "wrist" not in name and "xray" not in name:
+        raise HTTPException(
+            status_code=400,
+            detail="Upload only wrist xray"
+        )
 
-def image_to_base64(
-    image_path: str,
-    size: tuple[int, int] | None = None,
-    quality: int = 80
-) -> str:
-    img = cv2.imread(image_path)
+    # grayscale check
+    img = cv2.imread(temp_path)
+
     if img is None:
-        raise Exception(f"Could not read image: {image_path}")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid image"
+        )
 
-    if size is not None:
-        img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+    b, g, r = cv2.split(img)
 
-    success, buffer = cv2.imencode(
-        ".jpg",
-        img,
-        [int(cv2.IMWRITE_JPEG_QUALITY), quality],
-    )
+    diff1 = cv2.absdiff(b, g).mean()
+    diff2 = cv2.absdiff(g, r).mean()
+    diff3 = cv2.absdiff(b, r).mean()
 
-    if not success:
-        raise Exception("Image compression failed")
-
-    return base64.b64encode(buffer).decode("utf-8")
+    if diff1 > 15 or diff2 > 15 or diff3 > 15:
+        raise HTTPException(
+            status_code=400,
+            detail="Only X-ray allowed"
+        )
 
 
-def predict_fracture_probability(image_path: str) -> float:
-    image = Image.open(image_path).convert("RGB")
-    input_tensor = eff_transform(image).unsqueeze(0).to(DEVICE)
+# ---------------- UTILS ----------------
+
+def image_to_base64(path, size=None, quality=80):
+    img = cv2.imread(path)
+
+    if size:
+        img = cv2.resize(img, size)
+
+    _, buf = cv2.imencode(".jpg", img,
+        [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+
+    return base64.b64encode(buf).decode()
+
+
+def predict_fracture_probability(path):
+
+    image = Image.open(path).convert("RGB")
+    x = eff_transform(image).unsqueeze(0).to(DEVICE)
 
     with torch.no_grad():
-        logits = efficientnet_model(input_tensor)
+        logits = efficientnet_model(x)
         probs = torch.softmax(logits, dim=1)[0]
 
-    # class index 1 = fracture
-    return float(probs[1].item())
+    return float(probs[1])
 
 
-def serialize_firestore_value(value):
-    if value is None:
-        return None
-
-    if hasattr(value, "isoformat"):
-        try:
-            return value.isoformat()
-        except Exception:
-            return str(value)
-
-    return value
-
-
-def serialize_firestore_doc(doc) -> dict:
-    data = doc.to_dict() or {}
-    data["id"] = doc.id
-
-    if "createdAt" in data:
-        data["createdAt"] = serialize_firestore_value(data.get("createdAt"))
-
-    return data
-
+# ---------------- ROOT ----------------
 
 @app.get("/")
 def root():
-    return {"message": "MEDORA backend is running"}
+    return {"ok": True}
 
+
+# ---------------- ANALYZE ----------------
 
 @app.post("/analyze")
 async def analyze(
     file: UploadFile = File(...),
-    groundTruth: str | None = Form(default=None),
-    patientName: str | None = Form(default=None),
-    userId: str | None = Form(default=None),
-    userEmail: str | None = Form(default=None),
+    groundTruth: str | None = Form(None),
+    patientName: str | None = Form(None),
+    userId: str | None = Form(None),
+    userEmail: str | None = Form(None),
 ):
-    temp_filename = os.path.join(BASE_DIR, f"temp_{uuid.uuid4()}.png")
+
+    temp = os.path.join(
+        BASE_DIR,
+        f"temp_{uuid.uuid4()}.png"
+    )
+
     annotated_file = None
 
     try:
-        with open(temp_filename, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
 
-        original_base64 = image_to_base64(
-            temp_filename,
-            size=(512, 512),
-            quality=80
-        )
+        with open(temp, "wb") as buf:
+            shutil.copyfileobj(file.file, buf)
 
-        fracture_probability = predict_fracture_probability(temp_filename)
+        # ✅ VALIDATE
+        validate_wrist_xray(file, temp)
 
-        results = yolo_model(temp_filename, conf=0.1)
+        original_base64 = image_to_base64(temp, (512,512))
+
+        fracture_prob = predict_fracture_probability(temp)
+
+        results = yolo_model(temp, conf=0.1)
         r = results[0]
 
         boxes = []
-        yolo_confidence = 0.0
+        yolo_conf = 0
 
-        if r.boxes is not None and len(r.boxes) > 0:
-            yolo_confidence = float(r.boxes.conf.max().item())
+        if r.boxes:
+            yolo_conf = float(
+                r.boxes.conf.max().item()
+            )
+
             for box in r.boxes.xyxy:
-                x1, y1, x2, y2 = box.tolist()
+                x1,y1,x2,y2 = box.tolist()
                 boxes.append({
-                    "x1": float(x1),
-                    "y1": float(y1),
-                    "x2": float(x2),
-                    "y2": float(y2),
+                    "x1":x1,
+                    "y1":y1,
+                    "x2":x2,
+                    "y2":y2,
                 })
 
-        prediction = "Fracture" if (len(boxes) > 0 or fracture_probability >= 0.5) else "Normal"
-        confidence = max(float(fracture_probability), float(yolo_confidence))
+        prediction = (
+            "Fracture"
+            if boxes or fracture_prob>=0.5
+            else "Normal"
+        )
+
+        confidence = max(
+            fracture_prob,
+            yolo_conf
+        )
 
         annotated = r.plot()
-        annotated_file = os.path.join(BASE_DIR, f"annotated_{uuid.uuid4()}.jpg")
+
+        annotated_file = os.path.join(
+            BASE_DIR,
+            f"ann_{uuid.uuid4()}.jpg"
+        )
+
         cv2.imwrite(annotated_file, annotated)
 
         annotated_base64 = image_to_base64(
             annotated_file,
-            size=(512, 512),
-            quality=80
+            (512,512)
         )
 
         gradcam_base64 = generate_gradcam(
             efficientnet_model,
-            temp_filename,
-            target_class=1
+            temp,
+            1
         )
 
-        risk_level = (
-            "High" if confidence >= 0.8
-            else "Moderate" if confidence >= 0.5
+        risk = (
+            "High" if confidence>=0.8
+            else "Moderate" if confidence>=0.5
             else "Low"
         )
 
-        summary = (
-            "Suspicious fracture-related region detected in the wrist radiograph."
-            if prediction == "Fracture"
-            else "No strong fracture-related localization detected by the model."
-        )
+        doc = db.collection("cases").document()
 
-        recommendation = (
-            "Clinical review recommended. Correlate with radiologist interpretation."
-            if prediction == "Fracture"
-            else "Model suggests a normal case, but clinical review is still advised."
-        )
+        doc.set({
 
-        normalized_ground_truth = clean_label(groundTruth)
-        response_created_at = datetime.now(timezone.utc).isoformat()
-
-        firestore_payload = {
-            "patientName": patientName or "Unknown",
             "prediction": prediction,
             "confidence": confidence,
-            "fractureProbability": fracture_probability,
-            "yoloConfidence": yolo_confidence,
-            "riskLevel": risk_level,
+            "riskLevel": risk,
             "boxes": boxes,
             "originalImageBase64": original_base64,
             "annotatedImageBase64": annotated_base64,
             "gradCamBase64": gradcam_base64,
-            "modelName": "EfficientNet-B3 + YOLOv8",
-            "summary": summary,
-            "recommendation": recommendation,
-            "createdAt": firestore.SERVER_TIMESTAMP,
-        }
+            "createdAt": firestore.SERVER_TIMESTAMP
 
-        if userId:
-            firestore_payload["userId"] = userId
+        })
 
-        if userEmail:
-            firestore_payload["userEmail"] = userEmail
-
-        if normalized_ground_truth is not None:
-            firestore_payload["groundTruth"] = normalized_ground_truth
-
-        doc_ref = db.collection("cases").document()
-        doc_ref.set(firestore_payload)
-
-        response_payload = {
-            "id": doc_ref.id,
-            "patientName": patientName or "Unknown",
+        return {
+            "id": doc.id,
             "prediction": prediction,
             "confidence": confidence,
-            "fractureProbability": fracture_probability,
-            "yoloConfidence": yolo_confidence,
-            "riskLevel": risk_level,
+            "riskLevel": risk,
             "boxes": boxes,
             "originalImageBase64": original_base64,
             "annotatedImageBase64": annotated_base64,
             "gradCamBase64": gradcam_base64,
-            "modelName": "EfficientNet-B3 + YOLOv8",
-            "summary": summary,
-            "recommendation": recommendation,
-            "createdAt": response_created_at,
         }
-
-        if userId:
-            response_payload["userId"] = userId
-
-        if userEmail:
-            response_payload["userEmail"] = userEmail
-
-        if normalized_ground_truth is not None:
-            response_payload["groundTruth"] = normalized_ground_truth
-
-        return response_payload
 
     except Exception as e:
-        print("ANALYZE ERROR:", str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+
+        print("ERROR", e)
+
+        raise HTTPException(
+            500,
+            str(e)
+        )
 
     finally:
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
+
+        if os.path.exists(temp):
+            os.remove(temp)
+
         if annotated_file and os.path.exists(annotated_file):
             os.remove(annotated_file)
-
-
-@app.get("/cases")
-def get_cases():
-    try:
-        docs = db.collection("cases").order_by(
-            "createdAt",
-            direction=firestore.Query.DESCENDING
-        ).stream()
-
-        return [serialize_firestore_doc(doc) for doc in docs]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/cases/{case_id}")
-def get_case(case_id: str):
-    try:
-        doc = db.collection("cases").document(case_id).get()
-        if not doc.exists:
-            raise HTTPException(status_code=404, detail="Case not found")
-        return serialize_firestore_doc(doc)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.patch("/cases/{case_id}/label")
-def update_case_label(case_id: str, groundTruth: str = Form(...)):
-    try:
-        gt = clean_label(groundTruth)
-
-        if gt not in {"Fracture", "Normal"}:
-            raise HTTPException(
-                status_code=400,
-                detail="groundTruth must be Fracture or Normal"
-            )
-
-        ref = db.collection("cases").document(case_id)
-        snap = ref.get()
-
-        if not snap.exists:
-            raise HTTPException(status_code=404, detail="Case not found")
-
-        ref.update({"groundTruth": gt})
-        updated = ref.get()
-        return serialize_firestore_doc(updated)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/evaluation")
-def get_evaluation():
-    try:
-        docs = db.collection("cases").stream()
-
-        rows = []
-        for doc in docs:
-            data = doc.to_dict() or {}
-            rows.append({
-                "groundTruth": data.get("groundTruth") or data.get("actualLabel") or data.get("trueLabel"),
-                "prediction": data.get("prediction"),
-                "score": float(data.get("fractureProbability", data.get("confidence", 0.0)) or 0.0),
-            })
-
-        evaluation = compute_binary_metrics(rows)
-        return evaluation
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
